@@ -1,9 +1,52 @@
 """Every setting the pipeline reads, in one module.
 
-Both halves — ingestion and retrieval — must agree on these. If ingestion embeds
-with one model and retrieval queries with another, the index returns well-formed
-results with plausible scores that happen to be meaningless, and nothing errors.
-The manifest in `index.py` is the guard against exactly that.
+Where these are used:
+
+    config.py
+        |
+        |-- EMBED_MODEL, EMBED dimensions ----> ingestion AND retrieval
+        |                                       both must agree, or results
+        |                                       are meaningless with no error
+        |
+        |-- CHUNK_TOKENS ---------------------> chunking.py
+        |
+        |-- FIGURE_*, DO_* -------------------> docling_io.py
+        |                                       what runs during a parse
+        |
+        |-- TABLE_* --------------------------> tables.py
+        |
+        |-- PINECONE_* -----------------------> index.py, sync.py
+        |                                       request and metadata limits
+        |
+        v
+    read ONCE, at import
+
+
+THE IMPORT-TIME READ MATTERS
+----------------------------
+
+These values are read from the environment when this module is first
+imported, and never again.
+
+So setting an environment variable in a notebook cell AFTER importing the
+package has no effect, and nothing warns you — the package simply keeps what
+it read. Set them first, or restart the kernel.
+
+Run `python check_config.py` to see what is actually in effect versus what
+the environment says.
+
+
+THE ONE THAT MUST MATCH ON BOTH SIDES
+-------------------------------------
+
+EMBED_MODEL.
+
+Ingest with one model and query with another and you get results back, with
+scores that look reasonable, that are meaningless. There is no error and no
+other symptom.
+
+That is what the manifest in index.py exists to prevent — it records how the
+index was built and refuses to run retrieval when the settings disagree.
 """
 
 import os
@@ -96,8 +139,36 @@ PINECONE_REQUEST_BYTES = 2 * 1024 * 1024  # per upsert request
 
 OPENAI_EMBED_MAX_INPUTS = 2048           # per embeddings request
 
-
-OPENAI_EMBED_MAX_TOKENS = 300_000        # per embeddings request
+# The API's real hard limit is 300,000. This is set BELOW it, not at it.
+#
+# WHAT WENT WRONG WITHOUT A MARGIN
+#
+# Set at exactly 300_000 with no buffer, two documents in a 20-document
+# corpus run — 480 records and 493 records — each produced a single
+# embeddings request that OpenAI rejected:
+#
+#     "Requested 304700 tokens, max 300000 tokens per request"
+#     "Requested 459215 tokens, max 300000 tokens per request"
+#
+# Neither document had an oversized record — both runs logged `max 1024`
+# tokens per chunk, the CHUNK_TOKENS ceiling, correctly enforced. The
+# overshoot happened at the BATCH level, aggregating many compliant records
+# into one request that summed past the true cap. `_batches()` closes a
+# batch before adding a text that would push it over — correct in principle
+# — but a cap set at the exact hard limit has no room to absorb anything:
+# a tokenizer that counts even slightly differently from OpenAI's own count,
+# rounding, or per-request overhead the API charges but a local count
+# doesn't. At zero margin, any of those turns "should fit" into "rejected."
+#
+# Every other budget in this codebase leaves room on purpose — see
+# chunking.py's `_finalise`, which computes the Pinecone metadata budget as
+# the hard cap MINUS overhead MINUS a fixed buffer, not the hard cap itself.
+# This should have matched that pattern from the start and didn't.
+#
+# 250,000 leaves 50,000 tokens — about 17% — of headroom under the real
+# limit. That is generous enough to absorb a counting discrepancy on a
+# single record, not just on the aggregate.
+OPENAI_EMBED_MAX_TOKENS = 250_000         # per embeddings request, with margin
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,10 +222,78 @@ FIGURE_PROMPT = (
 FIGURE_AREA_THRESHOLD = float(os.getenv("FIGURE_AREA_THRESHOLD", "0.01"))
 
 
-# Render scale for figure crops. At 1.0 the axis labels in a chart are too small for
-# the vision model to read, and it invents plausible numbers rather than reporting
-# real ones. 2.0 is where labels become legible without the payload becoming absurd.
-FIGURE_RENDER_SCALE = 2.0
+# Render scale for figure crops. At 1.0 the axis labels in a chart are too small
+# for the vision model to read, and it invents plausible numbers rather than
+# reporting real ones. 2.0 is where labels become legible.
+#
+# It is also the single most expensive setting here on a figure-dense document:
+# 2x means four times the pixels, rendered on CPU, for every figure.
+FIGURE_RENDER_SCALE = float(os.getenv("FIGURE_RENDER_SCALE", "2.0"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What to run, and what each costs
+#
+# EVERY ONE OF THESE IS A MODEL PASS, ON CPU, PER ELEMENT.
+#
+# A 7-page report with 17 figures is not a small document to this pipeline: it
+# is 17 crops rendered at 2x, then classified, then chart-extracted, then sent
+# to a vision model. Four passes over each figure.
+#
+# Measure before deciding. `python profile_parse.py your.pdf` times each flag
+# separately on your machine with your document, and prints what each one adds.
+#
+#   TABLE_MODE_ACCURATE   materially better on nested headers, and several
+#                         times slower than FAST. Worth it for clinical and
+#                         financial tables; probably not for simple grids.
+#
+#   DO_CHART_EXTRACTION   reads numeric series off rasterised charts. Measured
+#                         0 of 17 on vector-drawn charts — which is most
+#                         financial and research PDFs. Costs a model pass per
+#                         figure and returns nothing on those. Off by default
+#                         for that reason.
+#
+#   DO_CLASSIFICATION     tags each picture chart/photo/logo. Cheap relative to
+#                         the others, and what lets you tell a header wordmark
+#                         from an exhibit afterwards.
+#
+#   DO_FORMULA / CODE     CodeFormula. Necessary if your documents contain
+#                         equations — without it they become the placeholder
+#                         `formula-not-decoded` and their content is gone.
+#                         Pure waste if they do not.
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CONDITIONAL vs UNCONDITIONAL — the distinction that decides what to switch off
+#
+# Some models run once per element, whether or not that element needs them.
+# Others run only where they are needed. Switching off the wrong kind saves
+# almost nothing and loses content.
+#
+#   UNCONDITIONAL      runs on every figure, or every candidate region
+#     chart extraction        17 figures = 17 model passes
+#     classification          17 figures = 17 model passes
+#     formula / code          every candidate region
+#     rendering at 2x         four times the pixels, every figure
+#
+#   CONDITIONAL        runs only where there is work to do
+#     OCR                     only regions with NO extractable text layer
+#
+# On a digital PDF, OCR is nearly free: most text is already in the layer, so
+# it runs on a handful of graphic regions and skips everything else.
+#
+# But it is the ONLY thing that reads text baked into a graphic. An exhibit
+# drawn as coloured boxes with a bulleted list inside is invisible without it —
+# the caption above and the source line below survive, because those are real
+# page text, and everything inside the boxes disappears.
+#
+# So: turn off the unconditional ones. Leave OCR on unless you have measured
+# that it costs you something.
+DO_OCR = os.getenv("DO_OCR", "1") == "1"
+
+TABLE_MODE_ACCURATE = os.getenv("TABLE_MODE_ACCURATE", "1") == "1"
+DO_CHART_EXTRACTION = os.getenv("DO_CHART_EXTRACTION", "0") == "1"
+DO_CLASSIFICATION = os.getenv("DO_CLASSIFICATION", "1") == "1"
+DO_FORMULA = os.getenv("DO_FORMULA", "1") == "1"
+DO_CODE = os.getenv("DO_CODE", "1") == "1"
 
 
 # The summary exists to state what a reader sees in a table but that appears in no
