@@ -1,0 +1,43 @@
+{
+  "runtime_arn": "arn:aws:bedrock-agentcore:us-east-1:234360896963:runtime/supervisor-A1lKCeBDih",
+  "param_prefix": "/trial-agents/supervisor",
+  "specialists": {
+    "trial_graph": {
+      "arn": "arn:aws:bedrock-agentcore:us-east-1:234360896963:runtime/trial_graph-Z3tPk8FeC7",
+      "description": "Registry facts and relationships for the 20 trials, from a Neo4j graph: lead sponsor and collaborators, sites (facility, city) and countries, phase, status, dates, enrollment, conditions, primary and secondary outcomes, the registry's eligibility text and age limits, and which trials the registry indexes under a MeSH term (the only drug-name lookup; no arms or doses). Also each protocol's structure: its docId, sections in order, pages, and table and figure counts. Finds trials by these facts ('Novo Nordisk's trials', 'sites in Korea'). Holds no protocol passage text."
+    },
+    "trial_search": {
+      "arn": "arn:aws:bedrock-agentcore:us-east-1:234360896963:runtime/trial_search-3kibQFE3Ag",
+      "description": "What the trial protocols actually say: eligibility wording, study design, endpoint definitions, dosing, safety and adverse event sections, and the values inside protocol tables. Answers by retrieving passages. Resolves a trial named in the question \u2014 NCT number, acronym, title words, drug or condition \u2014 to its protocol itself, through the registry graph's name index. Does not answer sponsor, site, phase or other registry questions."
+    }
+  },
+  "guardrail": {
+    "id": "cgsmh30cjk1o",
+    "arn": "arn:aws:bedrock:us-east-1:234360896963:guardrail/cgsmh30cjk1o",
+    "version": "3"
+  },
+  "prompts": {
+    "system": {
+      "id": "QHPW1MAULF",
+      "arn": "arn:aws:bedrock:us-east-1:234360896963:prompt/QHPW1MAULF",
+      "version": "6",
+      "variables": [
+        "available_agents",
+        "max_agent_calls_per_turn"
+      ]
+    },
+    "compose": {
+      "id": "P50MU2WD6K",
+      "arn": "arn:aws:bedrock:us-east-1:234360896963:prompt/P50MU2WD6K",
+      "version": "3",
+      "variables": [
+        "analyst",
+        "evidence",
+        "question"
+      ]
+    }
+  },
+  "limits": {
+    "max_agent_calls_per_turn": 6
+  }
+}

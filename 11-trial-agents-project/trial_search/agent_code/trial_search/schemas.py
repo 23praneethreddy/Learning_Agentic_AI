@@ -1,0 +1,157 @@
+"""Output contract for the trial_search agent.
+
+    model emits          ModelDecision        small judgment, no data
+    tools write          captured_passages    in STATE, never retyped
+                         resolved_trials      in STATE, from resolve_trial
+    orchestrate builds   TrialSearchResponse  from STATE + decision
+
+A passage has one shape whichever tool produced it. `origin` records
+which: "search" (entry), "neighbor" (Case A), "table" (Case C). score is
+set only for search hits — an expanded chunk was fetched by id, not
+ranked, so it has no similarity score.
+
+WHAT THIS DOES NOT DO
+
+    ModelDecision does not carry passage text or chunk ids. The model
+    cannot claim evidence it did not retrieve: every passage in the final
+    response comes from a tool's own return value.
+
+    The final `entities` are not the model's when the graph knows them:
+    assemble() maps each passage's doc_id to its nctId through what
+    resolve_trial returned. The model's list is used only when no trial
+    was resolved (a pattern question searched across every protocol).
+"""
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class ModelDecision(BaseModel):
+    """The only structured output the model writes, after retrieving."""
+    entities: list[str] = Field(
+        default_factory=list,
+        description="NCT numbers of the trials the answer is about, copied from "
+                    "resolve_trial results. Empty when no trial was resolved.")
+    answerable: bool = Field(
+        default=True,
+        description="False if the corpus has no relevant passage. When False, "
+                    "explain in note.")
+    note: str = Field(
+        default="",
+        description="Brief factual note: why unanswerable, or a caveat "
+                    "(e.g. 'the eligibility list continues past the budget').")
+
+
+class TokenUsage(BaseModel):
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    llm_calls: int = 0
+    model_id: str = ""
+
+
+class Passage(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str
+    origin: Literal["search", "neighbor", "table"]
+    score: float | None = None          # vector similarity (Pinecone)
+    # Cohere relevance, set only on search hits that were re-ranked. Declared
+    # here because pydantic drops undeclared fields: without this line the
+    # Lambda's score would vanish before the Supervisor ever saw it.
+    rerank_score: float | None = None
+    content_type: str = ""
+    headings: list[str] = Field(default_factory=list)
+    page: int | None = None
+    position: int | None = None
+    table_id: str = ""
+    n_fragments: int | None = None
+    n_tokens: int | None = None
+
+
+class ResolvedTrial(BaseModel):
+    """One candidate resolve_trial returned — from the registry graph."""
+    nct_id: str
+    acronym: str = ""
+    title: str = ""
+    doc_id: str | None = None          # None: the trial has no protocol in the corpus
+    matched_conditions: list[str] = Field(default_factory=list)
+    score: float = 0.0
+
+
+class RetrievalStats(BaseModel):
+    """What the loop actually spent — for the Supervisor and for traces."""
+    resolve_calls: int = 0
+    search_calls: int = 0
+    neighbor_calls: int = 0
+    table_calls: int = 0
+    expansion_tokens: int = 0
+    expansion_token_budget: int = 0
+
+
+class SearchQuery(BaseModel):
+    """One semantic_search as it actually ran — recorded by the middleware
+    from the tool call and its result, never reported by the model."""
+    query: str
+    doc_id: str | None = None
+    content_type: str | None = None
+    top_k: int | None = None
+    candidates: int = 0          # the recall pool Pinecone returned
+    results: int = 0             # passages kept after re-ranking
+    reranked: bool | None = None
+    succeeded: bool = True
+
+
+class TrialSearchResponse(BaseModel):
+    """Returned to the Supervisor.
+
+    result_shape:
+        passages       at least one passage retrieved
+        empty          searched, nothing matched
+        unanswerable   the model judged the corpus does not cover it
+        not_executed   no search ran at all — a hollow decision
+    """
+    result_shape: Literal["passages", "empty", "unanswerable", "not_executed"]
+    passages: list[Passage] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+    result_note: str = ""
+    resolved: list[ResolvedTrial] = Field(
+        default_factory=list,
+        description="Every trial resolve_trial returned this turn, deduplicated.")
+    stats: RetrievalStats = Field(default_factory=RetrievalStats)
+    searches: list[SearchQuery] = Field(
+        default_factory=list,
+        description="Every search that ran, in order: the query, its scope, what came back.")
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+
+
+def collect_usage(messages, model_id: str) -> TokenUsage:
+    """Sum usage across every LLM call. add_usage also sums cache reads,
+    which a manual field sum silently drops."""
+    from langchain_core.messages.ai import add_usage
+
+    total, calls = None, 0
+    for message in messages or []:
+        meta = getattr(message, "usage_metadata", None)
+        if meta is None and isinstance(message, dict):
+            meta = message.get("usage_metadata")
+        if meta:
+            total = add_usage(total, meta)
+            calls += 1
+    if not total:
+        return TokenUsage(model_id=model_id)
+
+    usage = TokenUsage(
+        model_id=model_id, llm_calls=calls,
+        input_tokens=int(total.get("input_tokens", 0) or 0),
+        output_tokens=int(total.get("output_tokens", 0) or 0),
+        total_tokens=int(total.get("total_tokens", 0) or 0))
+    if not usage.total_tokens:
+        usage.total_tokens = usage.input_tokens + usage.output_tokens
+    cached = (total.get("input_token_details") or {}).get("cache_read")
+    if cached:
+        usage.cached_input_tokens = int(cached)
+    return usage

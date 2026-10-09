@@ -1,0 +1,15 @@
+# Data preparation and the KB feed (local only)
+pandas>=2.0
+numpy>=1.24
+duckdb>=1.0
+openpyxl>=3.1
+# Postgres load
+psycopg[binary]>=3.1
+# Pinecone publish (embeddings: OpenAI text-embedding-3-small)
+pinecone>=7.0
+openai>=1.40
+# AWS: RDS deploy, Secrets Manager
+boto3>=1.34
+# Tests
+pytest>=8.0
+moto[rds,ec2,secretsmanager,sts]>=5.0

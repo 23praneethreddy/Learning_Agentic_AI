@@ -1,0 +1,767 @@
+"""Bedrock Guardrail, applied through the ApplyGuardrail API.
+
+High-level flow:
+
+    Analyst question
+          │
+          ▼
+    before_agent
+          │
+          ▼
+    ApplyGuardrail(source="INPUT")
+          │
+          ├── intervened ──► GuardrailBlocked
+          │
+          └── allowed
+                │
+                ▼
+          Agent loop
+          ┌───────────────┐
+          │               │
+          ▼               │
+        Model             │
+          │               │
+          ▼               │
+      after_model         │
+          │               │
+          ▼               │
+    ApplyGuardrail        │
+    source="OUTPUT"       │
+          │               │
+          ├── blocked ────┘
+          │
+          └── allowed
+                │
+                ▼
+              Tools
+
+
+WHY ApplyGuardrail INSTEAD OF guardrail_config
+-----------------------------------------------
+
+guardrail_config is a parameter of Amazon Bedrock's Converse API.
+
+The Trial Graph agent uses an OpenAI chat model.
+
+Therefore, passing guardrail_config to the model would not protect the
+OpenAI model.
+
+Instead, ApplyGuardrail is called directly through the Bedrock Runtime API.
+
+This makes the guardrail independent of the LLM provider.
+
+
+WHAT IS CHECKED
+---------------
+
+INPUT:
+    The analyst's question.
+
+OUTPUT:
+    Text authored by the model.
+
+    This includes:
+        - normal AI message content
+        - ModelDecision.note
+        - ModelDecision.clarifying_question
+
+WHAT IS NOT CHECKED
+-------------------
+
+Retrieved Neo4j data and protocol evidence are NOT sent through the
+output guardrail.
+
+Reason:
+
+Clinical-trial data may legitimately contain content such as:
+
+    - deaths
+    - overdoses
+    - adverse events
+    - serious medical events
+
+These are evidence, not model-generated content.
+
+Applying content filtering to retrieved clinical evidence could therefore
+block legitimate information.
+
+The evidence should instead be treated as data/untrusted_data when passed
+back into the model.
+
+
+IMPORTANT DESIGN PRINCIPLE
+--------------------------
+
+The guardrail does not rewrite content.
+
+If Bedrock reports:
+
+    GUARDRAIL_INTERVENED
+
+this module raises GuardrailBlocked.
+
+The caller (core.orchestrate()) converts that exception into an
+unanswerable TrialGraphResponse.
+
+BLOCKED VERSUS MASKED
+---------------------
+
+GUARDRAIL_INTERVENED covers two different outcomes:
+
+    a policy BLOCKED the text     -> check() raises GuardrailBlocked
+    personal data was MASKED      -> check() returns the masked text
+    (an email -> {EMAIL})            and the turn continues with it
+
+Only an assessment with action BLOCKED is a block. Treating every
+intervention as a block would refuse a question for containing an email,
+and every answer quoting a protocol's contact phone number.
+
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+# AgentMiddleware allows us to execute custom logic around the LangChain
+# agent lifecycle.
+from langchain.agents.middleware import AgentMiddleware
+
+# HumanMessage represents user input.
+# AIMessage represents model-generated messages.
+from langchain_core.messages import AIMessage, HumanMessage
+
+# Tracing utilities used to create guardrail spans and record the
+# guardrail action in observability systems.
+from .tracing import set_span_attrs, span
+
+
+# Logger for guardrail-related events.
+log = logging.getLogger("agent.guardrail")
+
+
+# Cached boto3 Bedrock Runtime client.
+#
+# None means the client has not been initialized yet.
+#
+# The client is created lazily by _bedrock() and then reused.
+_client = None
+
+
+def _bedrock():
+    """Return a cached Bedrock Runtime client.
+
+    The client is created only when the first guardrail check occurs.
+
+    This avoids creating the boto3 client during module import and allows
+    the same client to be reused for subsequent requests.
+    """
+
+    global _client
+
+    # Create the client only once.
+    if _client is None:
+
+        # Import boto3 lazily as well.
+        import boto3
+
+        # Bedrock Runtime provides the ApplyGuardrail API.
+        _client = boto3.client("bedrock-runtime")
+
+    return _client
+
+
+class GuardrailBlocked(Exception):
+    """Exception raised when the Bedrock Guardrail intervenes.
+
+    source:
+        Indicates where the blocked content originated.
+
+        Examples:
+            INPUT
+            OUTPUT
+
+    message:
+        The message configured/returned by the Bedrock Guardrail.
+    """
+
+    def __init__(self, source: str, message: str):
+
+        # Give the exception a concise generic description.
+        super().__init__(
+            f"{source} blocked by guardrail"
+        )
+
+        # Preserve the source and configured guardrail message so the
+        # caller can build an appropriate response.
+        self.source = source
+        self.message = message
+
+
+def check(
+    text: str,
+    source: str,
+    guardrail_id: str,
+    guardrail_version: str,
+    client=None
+) -> str:
+    """Check text against the configured Bedrock Guardrail.
+
+    Parameters
+    ----------
+    text:
+        Text that should be checked.
+
+    source:
+        Bedrock Guardrail source.
+
+        INPUT:
+            Content coming from the user.
+
+        OUTPUT:
+            Content generated by the model.
+
+    guardrail_id:
+        Bedrock Guardrail identifier.
+
+    guardrail_version:
+        Version of the guardrail configuration.
+
+    client:
+        Optional Bedrock client.
+
+        Primarily useful for testing so a mock client can be injected.
+
+    Returns
+    -------
+    str
+        The text to use: unchanged, or with personal data masked
+        (an email -> {EMAIL}).
+
+    Raises
+    ------
+    GuardrailBlocked
+        When a policy BLOCKED the text. Masking personal data also
+        returns GUARDRAIL_INTERVENED, but is not a block.
+    """
+
+    # Empty text does not need to be checked.
+    #
+    # This also avoids unnecessary Bedrock API calls.
+    if not text or not text.strip():
+        return text
+
+    # Create a tracing span around the guardrail API call.
+    #
+    # We record the number of characters rather than the actual text.
+    with span(
+        f"guardrail.{source.lower()}",
+        chars=len(text)
+    ) as sp:
+
+        # Use the injected client when running tests.
+        #
+        # Otherwise create/use the cached Bedrock Runtime client.
+        response = (
+            client or _bedrock()
+        ).apply_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion=guardrail_version,
+
+            # Important:
+            #
+            # INPUT and OUTPUT have different meanings to the Bedrock
+            # Guardrail engine.
+            source=source,
+
+            # ApplyGuardrail expects content as a list of text objects.
+            content=[
+                {
+                    "text": {
+                        "text": text
+                    }
+                }
+            ]
+        )
+
+        # Record the action in telemetry.
+        #
+        # Example:
+        #
+        #     NONE
+        #     GUARDRAIL_INTERVENED
+        #
+        set_span_attrs(
+            sp,
+            action=response.get("action")
+        )
+
+    # Bedrock uses GUARDRAIL_INTERVENED both when the configured guardrail
+    # BLOCKS the content and when it only MASKS personal data.
+
+    # Nothing was masked either: use the text as it is.
+    if response.get("action") != "GUARDRAIL_INTERVENED":
+        return text
+
+    # A policy BLOCKED the text.
+    #
+    # Masking personal data also reports GUARDRAIL_INTERVENED; only an
+    # assessment with action BLOCKED is a block.
+    if _blocked(response.get("assessments", [])):
+
+        # Extract the guardrail's configured response message.
+        #
+        # If Bedrock does not provide one, use our fallback message.
+        message = next(
+            (
+                output.get("text")
+                for output in response.get("outputs", [])
+                if output.get("text")
+            ),
+            "This request was blocked by a content policy."
+        )
+
+        # Log the event without logging the actual user/model content.
+        log.warning(
+            "guardrail intervened on %s",
+            source
+        )
+
+        # Stop the agent workflow.
+        #
+        # core.orchestrate() catches this exception and converts it into
+        # an unanswerable TrialGraphResponse.
+        raise GuardrailBlocked(
+            source,
+            message
+        )
+    # Only personal data was masked (an email -> {EMAIL}).
+    #
+    # Continue with the masked text; the caller uses it in place of the
+    # original.
+    log.info(
+        "guardrail masked personal data in %s",
+        source,
+    )
+    return next(
+        (
+            output.get("text")
+            for output in response.get("outputs", [])
+            if output.get("text")
+        ),
+        text,
+    )
+
+# ===========================================================================
+# Blocked versus masked
+# ===========================================================================
+
+def _blocked(
+    node,
+) -> bool:
+    """True if any policy BLOCKED — as opposed to only masking.
+
+    ApplyGuardrail reports GUARDRAIL_INTERVENED both when a policy blocks
+    the text and when it only masks personal data (an email -> {EMAIL}).
+    Which one happened is in the assessments: each finding carries an
+    action — BLOCKED, ANONYMIZED or NONE — nested per policy (content
+    filters, denied topics, words, personal data).
+    """
+
+    # A policy entry that blocked.
+    if isinstance(node, dict):
+        return node.get("action") == "BLOCKED" or any(
+            _blocked(value)
+            for value in node.values()
+        )
+
+    # A list of policy entries: blocked if any one of them blocked.
+    if isinstance(node, list):
+        return any(
+            _blocked(value)
+            for value in node
+        )
+
+    return False
+
+
+
+
+
+def _text(content) -> str:
+    """Normalize LangChain message content into plain text.
+
+    LangChain message content can be:
+
+        str
+
+    or a list of content blocks such as:
+
+        [
+            {"type": "text", "text": "..."}
+        ]
+
+    This helper extracts only text blocks.
+
+    Any unsupported content type returns an empty string.
+    """
+
+    # Normal string message.
+    if isinstance(content, str):
+        return content
+
+    # LangChain/OpenAI-style content blocks.
+    if isinstance(content, list):
+
+        return " ".join(
+            block.get("text", "")
+            for block in content
+
+            # Only accept dictionary blocks.
+            if isinstance(block, dict)
+
+            # Only text blocks are relevant for the guardrail.
+            and block.get("type") == "text"
+        )
+
+    # Unsupported content type.
+    return ""
+
+
+class GuardrailMiddleware(AgentMiddleware):
+    """Apply the Bedrock Guardrail around the Trial Graph agent.
+
+    INPUT:
+        Checked once when the agent starts.
+
+    OUTPUT:
+        Checked after every model call.
+
+    This middleware therefore protects both sides of the LLM boundary:
+
+        User ──► INPUT guardrail ──► LLM
+
+        LLM ──► OUTPUT guardrail ──► next step / final response
+    """
+
+    def __init__(
+        self,
+        guardrail_id: str,
+        guardrail_version: str,
+        decision_tool: str,
+        client=None
+    ):
+        super().__init__()
+
+        # Keep the guardrail configuration together.
+        #
+        # self.args is later expanded using:
+        #
+        #     *self.args
+        #
+        self.args = (
+            guardrail_id,
+            guardrail_version
+        )
+
+        # Name of the structured decision tool.
+        #
+        # In Trial Graph this is:
+        #
+        #     ModelDecision
+        #
+        # We use this to extract note/clarifying_question fields from
+        # structured model output.
+        self.decision_tool = decision_tool
+
+        # Optional injected client.
+        #
+        # Tests can provide a fake client instead of calling AWS.
+        self.client = client
+
+    # ══════════════════════════════════════════════════════════════════
+    # INPUT
+    # ══════════════════════════════════════════════════════════════════
+
+    def _question(self, state) -> str:
+        """Extract the latest user question from agent state.
+
+        The agent state contains a list of messages.
+
+        We only want HumanMessage objects because this is the content
+        supplied by the analyst/user.
+        """
+
+        # Find all human/user messages.
+        human = [
+            message
+            for message in state.get("messages", [])
+            if isinstance(message, HumanMessage)
+        ]
+
+        # Check only the most recent human message.
+        #
+        # If there are no human messages, return an empty string.
+        return (
+            _text(human[-1].content)
+            if human
+            else ""
+        )
+
+    def _masked(
+        self,
+        state,
+        checked: str,
+    ):
+        """Replace the question with its masked version, if anything was masked.
+
+        check() returns the question unchanged, or with personal data
+        masked (an email -> {EMAIL}). A masked question REPLACES the
+        original — same message id, so the messages reducer overwrites it
+        and the model never sees the email or phone number.
+        """
+
+        # The latest human message — the question that was checked.
+        human = [
+            message
+            for message in state.get(
+                "messages",
+                []
+            )
+            if isinstance(
+                message,
+                HumanMessage,
+            )
+        ]
+
+        # Nothing was masked: no state update.
+        if not human or checked == _text(human[-1].content):
+            return None
+
+        # Personal data was masked: overwrite the question in state.
+        return {
+            "messages": [
+                HumanMessage(
+                    content=checked,
+                    id=human[-1].id,
+                )
+            ]
+        }
+
+
+    def before_agent(
+        self,
+        state,
+        runtime
+    ):
+        """Synchronous INPUT guardrail check.
+
+        This runs before the agent starts processing the question.
+        """
+
+        # Extract the latest user question.
+        question = self._question(state)
+
+        # Send it to Bedrock ApplyGuardrail as INPUT.
+        #
+        # If a policy blocks, check() raises GuardrailBlocked; if personal
+        # data is masked, it returns the masked question.
+        checked = check(
+            question,
+            "INPUT",
+            *self.args,
+            client=self.client
+        )
+
+        # Personal data masked: the masked question replaces the original.
+        # Nothing masked: None, no middleware state update.
+        return self._masked(
+            state,
+            checked,
+        )
+
+    async def abefore_agent(
+        self,
+        state,
+        runtime
+    ):
+        """Asynchronous INPUT guardrail check.
+
+        The agent uses ainvoke(), so this async middleware path is needed.
+
+        boto3's ApplyGuardrail call is synchronous, therefore we execute
+        it in a worker thread so the async event loop is not blocked.
+        """
+
+        # Run synchronous Bedrock API call in a worker thread.
+        checked = await asyncio.to_thread(
+            check,
+            self._question(state),
+            "INPUT",
+            *self.args,
+            client=self.client
+        )
+
+        # Personal data masked: the masked question replaces the original.
+        # Nothing masked: None, no middleware state update.
+        return self._masked(
+            state,
+            checked,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # OUTPUT
+    # ══════════════════════════════════════════════════════════════════
+
+    def _authored(self, state) -> str:
+        """Extract text authored by the model in the latest model turn.
+
+        IMPORTANT:
+
+        Do NOT simply use:
+
+            messages[-1]
+
+        because the last message may be a ToolMessage.
+
+        Example:
+
+            AIMessage
+                ↓
+            ToolMessage
+
+        The ToolMessage can become messages[-1], even though the content
+        we want to guard is the AIMessage.
+
+        Therefore we walk backwards until we find the newest AIMessage.
+
+
+        The function checks:
+
+            1. Normal AI message content
+
+            2. ModelDecision.note
+
+            3. ModelDecision.clarifying_question
+
+        The structured decision fields are important because the final
+        decision can be represented as a tool call rather than normal
+        message text.
+        """
+
+        # Walk backward through messages and find the newest AIMessage.
+        #
+        # This is safer than assuming the final message is the AI message.
+        message = next(
+            (
+                message
+                for message in reversed(
+                    state.get("messages", [])
+                )
+                if isinstance(message, AIMessage)
+            ),
+            None
+        )
+
+        # No model message means there is nothing to guard.
+        if message is None:
+            return ""
+
+        # Start with the normal model-generated message content.
+        parts = [
+            _text(message.content)
+        ]
+
+        # The structured ModelDecision may be represented as a tool call
+        # attached to the AIMessage.
+        for call in message.tool_calls or []:
+
+            # Gateway/tool names may contain prefixes, so use suffix
+            # matching just like the Cypher middleware.
+            if call["name"].endswith(
+                self.decision_tool
+            ):
+
+                # Extract structured tool arguments.
+                args = call.get("args", {})
+
+                # Include the model's note.
+                #
+                # This is important because the note may contain the
+                # explanation shown to the user.
+                parts.append(
+                    str(
+                        args.get("note")
+                        or ""
+                    )
+                )
+
+                # Include the model's clarification question.
+                #
+                # This is also model-authored output that may be returned
+                # to the user.
+                parts.append(
+                    str(
+                        args.get("clarifying_question")
+                        or ""
+                    )
+                )
+
+        # Remove empty values and combine everything into one string.
+        return " ".join(
+            part
+            for part in parts
+            if part
+        )
+
+    def after_model(
+        self,
+        state,
+        runtime
+    ):
+        """Synchronous OUTPUT guardrail check.
+
+        This executes after every model call.
+
+        The content checked is only model-authored text.
+        """
+
+        # Extract the latest AI-authored content.
+        authored_text = self._authored(state)
+
+        # Check it as OUTPUT.
+        check(
+            authored_text,
+            "OUTPUT",
+            *self.args,
+            client=self.client
+        )
+
+        # No state modification.
+        return None
+
+    async def aafter_model(
+        self,
+        state,
+        runtime
+    ):
+        """Asynchronous OUTPUT guardrail check.
+
+        Called after every asynchronous model invocation.
+
+        ApplyGuardrail itself is synchronous, so run it through
+        asyncio.to_thread().
+        """
+
+        # Execute the synchronous guardrail check outside the async
+        # event loop.
+        await asyncio.to_thread(
+            check,
+            self._authored(state),
+            "OUTPUT",
+            *self.args,
+            client=self.client
+        )
+
+        # No state modification.
+        return None
